@@ -1,0 +1,330 @@
+## Tiefe? Masse? Wasse'dasse?
+
+
+
+Unterfunktionen:
+```{r, help functions}
+train_values <- function(data, dimension, numb_rows,
+                         subsample, scope, dummy = 1L) {
+  if (checkmate::test_data_frame(data)) {
+    data <- as.matrix(data)
+  }
+
+  direction <- rnorm(dimension)
+  subsample_size <- subsample * numb_rows
+
+  sample_rows <- sample(seq_len(numb_rows))[seq_len(subsample_size)]
+  sub_data <- data[sample_rows, ]
+
+  projection <- sub_data %*% direction
+
+  maximum <- max(projection)
+  minimum <- min(projection)
+  midrange <- (maximum + minimum) / 2
+
+  random_selection <- runif(
+    1,
+    min = midrange - scope * (maximum - minimum) / 2,
+    max = midrange + scope * (maximum - minimum) / 2
+  )
+
+
+  number_of_lower_values <- sum(projection < random_selection)
+  rate_of_lower_values <- number_of_lower_values / subsample_size
+
+  # It is not necessary to save the rate_of_greater_values as suggested in the paper.
+  # Because 1 - rate_of_lower_values = rate_of_greater_values.
+  # But 'mass' uses the rate and 'depth' the absolute value,
+  # this is why the number_of_lower_values is saved instead.
+  list(
+    "direction" = direction,
+    "random_selection" = random_selection,
+    "rate_of_lower_values" = rate_of_lower_values,
+    "number_of_lower_values" = number_of_lower_values
+  )
+}
+
+
+evaluate_values <- function(halfspace, data, metric = c("mass", "depth")) {
+  if (checkmate::test_data_frame(data)) {
+    data <- as.matrix(data)
+  }
+  lower_value <- ifelse(
+    metric == "mass",
+    halfspace$rate_of_lower_value,
+    halfspace$number_of_lower_values
+  )
+
+  other_value <- ifelse(
+    metric == "mass",
+    1 - halfspace$rate_of_lower_values,
+    NA
+  )
+
+  projection <- data %*% halfspace$direction
+
+  evaluate_value <- ifelse(
+    projection < halfspace$random_selection,
+    lower_value,
+    other_value
+  )
+  evaluate_value
+}
+```
+
+Trainingsphase:
+```{r,train depth}
+train_depth <- function(data,
+                        n_halfspace,
+                        subsample = 1L,
+                        scope = 1L,
+                        seed = NULL) {
+  checkmate::assert(checkmate::check_data_frame(data), checkmate::check_matrix(data))
+  checkmate::assert_count(n_halfspace)
+  checkmate::assert_number(subsample, lower = 0, upper = 1)
+  checkmate::assert_number(scope, lower = 0)
+  checkmate::assert_number(seed, null.ok = TRUE)
+
+
+  dimension <- ncol(data)
+
+  if (dimension < 2L) {
+    stop("Dimension of data must be at least 2.")
+  }
+
+
+  set.seed(seed)
+
+  lapply(
+    seq_len(n_halfspace),
+    FUN = train_values,
+    data = data,
+    dimension = dimension,
+    numb_rows = nrow(data),
+    subsample = subsample,
+    scope = scope
+  )
+}
+```
+
+Testphase:
+```{r, evaluate depth}
+evaluate_depth <- function(data, halfspaces, metric = "mass") {
+  checkmate::assert(
+    checkmate::check_data_frame(data),
+    checkmate::check_matrix(data)
+  )
+  checkmate::assert_list(halfspaces)
+  checkmate::assert_set_equal(
+    names(halfspaces[[1]]),
+    c(
+      "direction", "random_selection",
+      "rate_of_lower_values", "number_of_lower_values"
+    )
+  )
+
+  if (ncol(data) != length(halfspaces[[1]]$direction)) {
+    stop("Training and evaluation data are not the same dimension!")
+  }
+
+  match.arg(metric, c("mass", "depth"))
+
+
+  halfspace_mass <- lapply(
+    halfspaces,
+    FUN = evaluate_values,
+    data = data,
+    metric = metric
+  )
+  halfspace_mass <- matrix(unlist(halfspace_mass), ncol = length(halfspace_mass))
+
+
+  if (metric == "mass") {
+    return(rowMeans(halfspace_mass))
+  }
+  return(apply(halfspace_mass, 1, min, na.rm = TRUE))
+}
+```
+
+
+Grafiken aus dem Paper:
+```{r, vis-hsm-prep}
+library(ggplot2)
+theme_set(theme_minimal())
+
+# visualize half-space depth/mass values for 2D-data on a grid of points
+# if no grid is provided, a grid over min/max +/- .2 * range of data is created.
+#   data: a 2d data.frame with columns z1 and z2
+#   points: add points in data to plot?
+#   metric: argument for evaluate_depth
+plot_depth <- function(halfspaces, data, grid = NULL, points = TRUE,
+                       gridlength = 70, metric = "mass") {
+  if (is.null(grid)) {
+    range_1 <- range(data$z1)
+    range_2 <- range(data$z2)
+    grid <- expand.grid(
+      z1 = seq(range_1[1] - .2 * diff(range_1),
+        range_1[2] + .2 * diff(range_1),
+        length = gridlength
+      ),
+      z2 = seq(range_2[1] - .2 * diff(range_2),
+        range_2[2] + .2 * diff(range_2),
+        length = gridlength
+      )
+    )
+  }
+  grid_depth <- evaluate_depth(
+    data = as.matrix(grid),
+    halfspaces = halfspaces,
+    metric = metric
+  )
+  grid_halfspaces <- cbind(grid, depth = grid_depth)
+  # use colors as in Chen et al.:
+  spectralcolors <- c(
+    "darkblue", "blue", "cyan", "lightgreen",
+    "yellow", "orange", "red", "darkred"
+  )
+  p <- ggplot(grid_halfspaces, aes(x = z1, y = z2)) +
+    geom_tile(aes(fill = depth, colour = depth)) +
+    scale_fill_gradientn(metric, colors = spectralcolors) +
+    scale_colour_gradientn(metric, colors = spectralcolors)
+
+  if (points & !is.null(data)) {
+    p <- p +
+      geom_point(
+        data = data,
+        aes(x = z1, y = z2),
+        colour = rgb(1, 1, 1, .8)
+      )
+  }
+  p
+}
+```
+Check Figure 3:
+```{r, vis-hsm-fig3, fig.width = 8, fig.height = 4, out.width = ".6\\textwidth"}
+library(gridExtra)
+data_fig3 <- data.frame(z1 = c(-2, -.5, .5, 2), z2 = 0)
+grid_fig3 <- expand.grid(
+  z1 = seq(-3, 3, l = 51),
+  z2 = seq(-3, 3, l = 51)
+)
+
+depth_fig3 <- train_depth(data_fig3,
+  n_halfspace = 1e4,
+  scope = 1, seed = 4163
+)
+# need scope > 1 for reliable halfspace _depth_ approximation:
+depth_fig3_scope15 <- train_depth(data_fig3,
+  n_halfspace = 1e3, scope = 1.5,
+  seed = 4163
+)
+gridExtra::grid.arrange(
+  plot_depth(depth_fig3_scope15,
+    data = data_fig3, grid = grid_fig3,
+    metric = "depth"
+  ) +
+    ggtitle("Tukey Halfspace Depth"),
+  plot_depth(depth_fig3, data = data_fig3, grid = grid_fig3) +
+    ggtitle("Halfspace Mass (Chen et al.)"),
+  nrow = 1
+)
+# NB: color scale not exactly as in Chen et al, but results seem very close...
+```
+
+Check Figure 5: 
+```{r, vis-hsm-fig5, fig.width = 8, fig.height = 4, out.width = ".6\\textwidth"}
+set.seed(187471431)
+# 2D standard Normal:
+cluster <- data.frame(
+  z1 = rnorm(50) / 2,
+  z2 = rnorm(50) / 2,
+  group = "cluster"
+)
+# polar coordinates: points with distance 3 to 5 from the origin, at 90° - 270°:
+left_anomalies <- data.frame(
+  angle = runif(10, pi / 2, 3 * pi / 2),
+  length = runif(10, 3, 5)
+)
+# convert to cartesian coords
+left_anomalies <- with(left_anomalies, data.frame(
+  z1 = length * cos(angle),
+  z2 = length * sin(angle),
+  group = "anomaly"
+))
+# ~ N_2(\mu = (6,0), \Sigma = I_2)
+right_anomalies <- data.frame(
+  z1 = rnorm(20) / 5 + 6,
+  z2 = rnorm(20) / 5,
+  group = "anomaly"
+)
+data_fig5 <- rbind(
+  cluster,
+  left_anomalies,
+  right_anomalies
+)
+
+hs_fig5 <- train_depth(data_fig5[, 1:2],
+  n_halfspace = 1e4, subsample = .5,
+  seed = 4165
+)
+fig5 <- plot_depth(hs_fig5, data = data_fig5[, 1:2], points = FALSE)
+# can't assign two colour scales to one plot, so plot 2 groups separately:
+fig5 +
+  geom_point(
+    data = subset(data_fig5, group == "cluster"),
+    aes(x = z1, y = z2), color = rgb(0, 0, 1, .5)
+  ) +
+  geom_point(
+    data = subset(data_fig5, group == "anomaly"),
+    aes(x = z1, y = z2), color = rgb(1, 0, 0, .5)
+  )
+```
+
+Ein paar Tests:
+```{r}
+library(testthat)
+
+test_that("Input and Output Checks", {
+  test_data_frame <- data.frame(a = rnorm(5), b = rnorm(5))
+
+  # Wrong dimension
+  expect_error(train_depth(data.frame(1), 2))
+
+  # Should work
+  test_train <- train_depth(test_data_frame, n_halfspace = 10L)
+
+  # train_depth result is of length n_halfpsace
+  expect_equal(length(test_train), 10L)
+
+  # Train and test dimension differ
+  expect_error(evaluate_depth(data.frame(a = 1, b = 2, c = 3), test_train))
+
+  # Wrong list
+  expect_error(evaluate_depth(test_data_frame, list("a" = 2, "g" = 4)))
+
+  # Example for dimension 3
+  set.seed(2020)
+  train_data3d <- data.frame(
+    x = runif(1000),
+    y = runif(1000), z = runif(1000)
+  )
+  test_data3d <- data.frame(
+    x = c(0.5, 0.4, 0.7, -1),
+    y = c(0.5, 0.4, 0.7, -1), z = c(0.5, 0.4, 0.7, -1)
+  )
+
+  train3d <- train_depth(train_data3d, n_halfspace = 2000, seed = 202020)
+
+  mass3d <- evaluate_depth(test_data3d, train3d)
+  tukey3d <- evaluate_depth(test_data3d, train3d, metric = "depth")
+
+  expect_true(identical(mass3d, sort(mass3d, decreasing = TRUE)))
+  expect_true(identical(tukey3d, sort(tukey3d, decreasing = TRUE)))
+})
+```
+Die Idee beim letzten Test für die dritte Dimension ist, dass für die Trainingsphase
+ein 3D Würfel, mit Seitenlänge eins erzeugt wird. 
+Der Punkt (1/2, 1/2, 1/2) ist genau die Mitte des Würfels, hier sollte die Tiefe/Masse
+am höchsten sein. 
+Je weiter weg man von diesen Punkt weg kommt desto niedriger ist die Tiefe/Masse,
+bis außerhalb des Würfels.
